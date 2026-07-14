@@ -1,41 +1,23 @@
-#include <executor.h>
-
 #include <iostream>
-#include <sstream>
 #include <vector>
-
 #include <unistd.h>   // for POSIX calls
 #include <sys/wait.h> // for waitpid() , wait()
 
-void Executor::execute(const std::string &command)
+#include "executor.h"
+
+void Executor::execute(const Command &command)
 {
-    std::istringstream iss(command);
 
-    std::vector<std::string> args; // dismantle the input into various arguments
-
-    std::string token;
-
-    while (iss >> token)
-    {
-        args.push_back(token);
-    }
-
-    // std::cout << "Parsed Arguments:\n" ;
-
-    // for(const auto& arg : args){
-    //     std::cout << arg << '\n' ;
-    // }
-
-    if (args.empty())
+    if (command.arguments.empty())
     {
         return;
     }
 
     std::vector<char *> argv;
 
-    for (auto &arg : args)
+    for (const auto &arg : command.arguments)
     {
-        argv.push_back(arg.data());
+        argv.push_back(const_cast<char *>(arg.c_str())); // stripping away the constness as the execvp is an older API and expects char*
     }
     argv.push_back(nullptr);
 
@@ -50,16 +32,14 @@ void Executor::execute(const std::string &command)
 
         exit(EXIT_FAILURE);
     }
-    else if (pid < 0)
-    {
-
-        perror("Child Process can't be created");
-
-        exit(EXIT_FAILURE);
-    }
-    else
+    else if (pid > 0)
     {
         // parent process
         waitpid(pid, nullptr, 0);
+    }
+    else
+    {
+        perror("pid");
+
     }
 }

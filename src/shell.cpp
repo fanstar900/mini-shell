@@ -1,5 +1,5 @@
 #include "shell.h"
-#include "executor.h"
+#include "command.h"
 
 #include <iostream>
 
@@ -34,14 +34,22 @@ std::string Shell::readInput() const
 
 
 void Shell::processInput(const std::string&input){
-    if(input == "exit"){
-        running = false ; 
-        return ;
-    }
-
-    // std::cout << "You Entered : " << input << std::endl;
     
-    Executor executor;
-    executor.execute(input) ;
+    /*
+    Inefficient => parser and executor are constructed for each processInput call, we should have them as internal data member for this shell
+    Parser parser ; 
+    Executor executor ;
+    */
+    
+    
+    Command command = parser.parse(input);
+
+    if(command.arguments.empty()) return ;
+
+    if(builtins.execute(command, running, previousDirectory)){
+        return ;
+    } 
+
+    executor.execute(command);
 
 }
