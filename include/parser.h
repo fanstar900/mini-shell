@@ -1,9 +1,11 @@
 #pragma once
 
 #include<string>
-#include "command.h"
+#include "pipeline.h"
 
 class Parser{
     public:
-        Command parse(const std::string& input);
+        Pipeline parse(const std::string& input);
+    private:
+        Command parseSingleCommand(const std::string& input);
 };

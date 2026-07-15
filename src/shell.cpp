@@ -1,5 +1,5 @@
 #include "shell.h"
-#include "command.h"
+#include "pipeline.h"
 
 #include <iostream>
 
@@ -42,14 +42,27 @@ void Shell::processInput(const std::string&input){
     */
     
     
-    Command command = parser.parse(input);
+    Pipeline pipeline = parser.parse(input);
 
-    if(command.arguments.empty()) return ;
+    // for(auto& cmd : pipeline.commands){
+    //     std::cout << cmd.program << std::endl;
+    // }
 
-    if(builtins.execute(command, running, previousDirectory)){
-        return ;
-    } 
+    // loop over pipeline for command and connect their file descriptors
 
-    executor.execute(command);
+
+
+    if(pipeline.commands.empty()) return ;
+
+    if(pipeline.commands.size() == 1){
+        if(builtins.execute(pipeline.commands[0],
+            running,
+            previousDirectory))
+        {
+            return; 
+        }
+    }
+
+    executor.execute(pipeline);
 
 }
