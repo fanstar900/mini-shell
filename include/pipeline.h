@@ -6,4 +6,6 @@
 class Pipeline{
     public:
         std::vector<Command> commands;
+
+        bool background = false;
 };

@@ -3,17 +3,18 @@
 #include <unistd.h>   // for POSIX calls
 #include <sys/wait.h> // for waitpid() , wait()
 #include <fcntl.h>    // for file descriptors
+#include <termios.h>
 
 #include "executor.h"
 
-void Executor::execute(const Pipeline &pipeline)
+void Executor::execute(const Pipeline &pipeline, JobManager& jobManager)
 {
     if (pipeline.commands.empty())
         return;
 
     if (pipeline.commands.size() == 1)
     {
-        executeSingleCommand(pipeline.commands[0]);
+        executeSingleCommand( pipeline.commands[0], pipeline.background, jobManager);
     }
     else
     {
@@ -210,19 +211,66 @@ void Executor::executePipeline(const Pipeline &pipeline)
 
 }
 
-void Executor::executeSingleCommand(const Command &command)
+void Executor::executeSingleCommand(const Command &command, bool background, JobManager& jobManager)
 {
 
     pid_t pid = fork();
 
     if (pid == 0)
     {
+        // if(setpgid(0, 0) < 0)
+        // {
+        //     perror("setpgid");
+        //     std::exit(EXIT_FAILURE);
+        // }
+
         executeSingleCommandHelper(command);
     }
     else if (pid > 0)
     {
-        // parent process
-        waitpid(pid, nullptr, 0);
+        // setpgid(pid,pid);
+
+        if(background)
+        {
+            int jobId =
+                jobManager.addJob(
+                    pid,
+                    pid,
+                    command.program,
+                    JobStatus::Running
+                );
+
+            std::cout
+                << "[" << jobId << "] "
+                << pid
+                << "\n";
+        }
+        else{
+            int status;
+
+            waitpid(
+                pid,
+                &status,
+                WUNTRACED
+            );
+            
+            if(WIFSTOPPED(status))
+            {
+                int jobId =
+                    jobManager.addJob(
+                        pid,
+                        pid,
+                        command.program,
+                        JobStatus::Stopped
+                    );
+
+                std::cout
+                    << "[" << jobId << "] Stopped "
+                    << command.program
+                    << "\n";
+            }
+        }
+
     }
     else
     {
@@ -293,6 +341,12 @@ void Executor::executeSingleCommandHelper(const Command &command)
 
         close(fd);
     }
+
+    signal(SIGINT, SIG_DFL);
+
+    signal(SIGTSTP, SIG_DFL);
+
+    signal(SIGQUIT, SIG_DFL);
 
     execvp(argv[0], argv.data()); // string,vector<char*>
 

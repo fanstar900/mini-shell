@@ -12,3 +12,8 @@ file(GLOB SOURCES
 )
 
 add_executable(mini-shell ${SOURCES})
+
+target_link_libraries(
+    mini-shell
+    readline
+)

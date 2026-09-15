@@ -6,21 +6,40 @@
 
 
 
-Pipeline Parser::parse(const std::string& input){
+Pipeline Parser::parse(const std::string& input)
+{
     Pipeline pipeline;
 
-    std::stringstream ss(input);
+    std::string processedInput = input;
+
+    // Remove trailing '&'
+    if(!processedInput.empty() &&
+       processedInput.back() == '&')
+    {
+        pipeline.background = true;
+
+        processedInput.pop_back();
+
+        // Remove any trailing spaces
+        while(!processedInput.empty() &&
+              std::isspace(processedInput.back()))
+        {
+            processedInput.pop_back();
+        }
+    }
+
+    std::stringstream ss(processedInput);
 
     std::string commandString;
 
-    while(std::getline(ss, commandString, '|')){
-
-        pipeline.commands.push_back(parseSingleCommand(commandString));
-
-
+    while(std::getline(ss, commandString, '|'))
+    {
+        pipeline.commands.push_back(
+            parseSingleCommand(commandString)
+        );
     }
 
-    return pipeline ;
+    return pipeline;
 }
 
 Command Parser::parseSingleCommand(const std::string& input){
