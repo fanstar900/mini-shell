@@ -1,86 +1,219 @@
-#include<iostream>
-#include<string>
-#include<sstream>
+#include <cctype>
+#include <string>
+#include <vector>
 
 #include "parser.h"
 
-
-
-Pipeline Parser::parse(const std::string& input)
+namespace
 {
-    Pipeline pipeline;
 
-    std::string processedInput = input;
+enum class TokenType
+{
+    Word,
+    Pipe,
+    Background,
+    RedirectIn,
+    RedirectOut,
+    RedirectAppend
+};
 
-    // Remove trailing '&'
-    if(!processedInput.empty() &&
-       processedInput.back() == '&')
+struct Token
+{
+    TokenType type;
+    std::string text;
+};
+
+// Splits the input on whitespace and on the operators | & < > >>,
+// so "ls>out.txt" and "ls > out.txt" give the same tokens.
+std::vector<Token> tokenize(const std::string& input)
+{
+    std::vector<Token> tokens;
+    std::string word;
+
+    auto finishWord = [&]()
     {
-        pipeline.background = true;
-
-        processedInput.pop_back();
-
-        // Remove any trailing spaces
-        while(!processedInput.empty() &&
-              std::isspace(processedInput.back()))
+        if(!word.empty())
         {
-            processedInput.pop_back();
+            tokens.push_back({TokenType::Word, word});
+            word.clear();
+        }
+    };
+
+    for(size_t i = 0; i < input.size(); i++)
+    {
+        char c = input[i];
+
+        if(std::isspace(static_cast<unsigned char>(c)))
+        {
+            finishWord();
+            continue;
+        }
+
+        switch(c)
+        {
+            case '|':
+                finishWord();
+                tokens.push_back({TokenType::Pipe, "|"});
+                break;
+
+            case '&':
+                finishWord();
+                tokens.push_back({TokenType::Background, "&"});
+                break;
+
+            case '<':
+                finishWord();
+                tokens.push_back({TokenType::RedirectIn, "<"});
+                break;
+
+            case '>':
+                finishWord();
+                if(i + 1 < input.size() && input[i + 1] == '>')
+                {
+                    tokens.push_back({TokenType::RedirectAppend, ">>"});
+                    i++;
+                }
+                else
+                {
+                    tokens.push_back({TokenType::RedirectOut, ">"});
+                }
+                break;
+
+            default:
+                word += c;
         }
     }
 
-    std::stringstream ss(processedInput);
+    finishWord();
 
-    std::string commandString;
-
-    while(std::getline(ss, commandString, '|'))
-    {
-        pipeline.commands.push_back(
-            parseSingleCommand(commandString)
-        );
-    }
-
-    return pipeline;
+    return tokens;
 }
 
-Command Parser::parseSingleCommand(const std::string& input){
-    Command command ;
+std::string unexpectedToken(const Token& token)
+{
+    return "syntax error near unexpected token `" + token.text + "'";
+}
 
-    std::istringstream iss(input);
+std::string trim(const std::string& text)
+{
+    size_t begin = 0;
+    size_t end = text.size();
 
-    std::string token;
+    while(begin < end && std::isspace(static_cast<unsigned char>(text[begin])))
+        begin++;
 
-    while(iss >> token){
-        if(token == ">"){
-            if(!(iss >> command.outputFile)){
-                std::cerr << "Syntax error: expected filename after '>'\n" ;
+    while(end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])))
+        end--;
+
+    return text.substr(begin, end - begin);
+}
+
+} // namespace
+
+bool Parser::parse(
+    const std::string& input,
+    Pipeline& pipeline,
+    std::string& error) const
+{
+    pipeline = Pipeline{};
+
+    std::vector<Token> tokens = tokenize(input);
+
+    if(tokens.empty())
+    {
+        return true;
+    }
+
+    Command current;
+
+    for(size_t i = 0; i < tokens.size(); i++)
+    {
+        const Token& token = tokens[i];
+
+        switch(token.type)
+        {
+            case TokenType::Word:
+                current.arguments.push_back(token.text);
+                break;
+
+            case TokenType::RedirectIn:
+            case TokenType::RedirectOut:
+            case TokenType::RedirectAppend:
+            {
+                if(i + 1 >= tokens.size())
+                {
+                    error = "syntax error: expected filename after '"
+                            + token.text + "'";
+                    return false;
+                }
+
+                const Token& target = tokens[++i];
+
+                if(target.type != TokenType::Word)
+                {
+                    error = unexpectedToken(target);
+                    return false;
+                }
+
+                if(token.type == TokenType::RedirectIn)
+                {
+                    current.inputFile = target.text;
+                }
+                else
+                {
+                    current.outputFile = target.text;
+                    current.append = (token.type == TokenType::RedirectAppend);
+                }
+                break;
             }
-            command.append = false ;
-        }else if(token == ">>"){
-            if(!(iss >> command.outputFile)){
-                std::cerr << "Syntax error: expected filename after '>>'\n" ;
-            }
-            command.append = true ;
-        }else if(token == "<"){
-            if(!(iss >> command.inputFile)){
-                std::cerr << "Syntax error: expected filename after '<'\n" ;
-            }
-        }else{
-            command.arguments.push_back(token); 
+
+            case TokenType::Pipe:
+                if(current.arguments.empty())
+                {
+                    error = unexpectedToken(token);
+                    return false;
+                }
+
+                pipeline.commands.push_back(std::move(current));
+                current = Command{};
+                break;
+
+            case TokenType::Background:
+                if(current.arguments.empty())
+                {
+                    error = unexpectedToken(token);
+                    return false;
+                }
+
+                if(i + 1 != tokens.size())
+                {
+                    error = "syntax error: '&' is only supported at the end of a command";
+                    return false;
+                }
+
+                pipeline.background = true;
+                break;
         }
-        
     }
 
-    if(!command.arguments.empty()){
-        command.program = command.arguments[0];
+    if(current.arguments.empty())
+    {
+        // "ls |" or a redirection with no command, such as "> out.txt"
+        error = pipeline.commands.empty()
+                    ? "syntax error: missing command"
+                    : "syntax error: missing command after '|'";
+        return false;
     }
 
-    // std::cout << command.program << std::endl;
-    // std::cout << command.inputFile << std::endl;
-    // std::cout << command.outputFile << std::endl;
-    // for(auto& arg : command.arguments){
-    //     std::cout << arg << std::endl;
-    // }
-    
+    pipeline.commands.push_back(std::move(current));
 
-    return command ;
+    pipeline.text = trim(input);
+
+    if(pipeline.background)
+    {
+        pipeline.text.pop_back(); // the trailing '&'
+        pipeline.text = trim(pipeline.text);
+    }
+
+    return true;
 }

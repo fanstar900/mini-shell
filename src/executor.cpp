@@ -1,57 +1,76 @@
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <vector>
 #include <unistd.h>   // for POSIX calls
-#include <sys/wait.h> // for waitpid() , wait()
-#include <fcntl.h>    // for file descriptors
-#include <termios.h>
+#include <fcntl.h>    // for open()
+#include <signal.h>
 
 #include "executor.h"
+#include "signals.h"
 
-void Executor::execute(const Pipeline &pipeline, JobManager& jobManager)
+namespace
 {
-    if (pipeline.commands.empty())
-        return;
 
-    if (pipeline.commands.size() == 1)
+// Kills and collects the processes already started for a pipeline that
+// could not be fully set up, and gives the terminal back to the shell.
+void abandonJob(Job& job, JobManager& jobManager)
+{
+    if(job.pids.empty())
     {
-        executeSingleCommand( pipeline.commands[0], pipeline.background, jobManager);
+        return;
     }
-    else
-    {
-        executeMultiPipeline(pipeline);
-    }
+
+    kill(-job.processGroupId, SIGKILL);
+
+    jobManager.waitInForeground(job, false);
 }
 
-void Executor::executeMultiPipeline(const Pipeline& pipeline){
+} // namespace
+
+void Executor::execute(
+    const Pipeline& pipeline,
+    JobManager& jobManager,
+    const BuiltinRunner& runBuiltin)
+{
+    if(pipeline.commands.empty())
+        return;
+
+    const bool foreground = !pipeline.background;
+    const bool interactive = jobManager.isInteractive();
+
+    Job job;
+    job.command = pipeline.text;
+
+    // Anything still buffered would otherwise be written again by children.
+    std::cout.flush();
+    std::fflush(nullptr);
 
     int previousRead = -1 ;
 
-    std::vector<pid_t> children;
-
     for(size_t i = 0 ; i < pipeline.commands.size() ; i++){
 
-        bool first = (i == 0);
         bool last = (i == pipeline.commands.size() - 1) ;
 
-        int pipefd[2];
+        int pipefd[2] = {-1, -1};
 
-        if(!last){
-            if(pipe(pipefd) < 0){
-                perror("pipe");
+        if(!last && pipe(pipefd) < 0){
+            perror("pipe");
 
-                if(previousRead != -1){
-                    close(previousRead);
-                }
-                return;
+            if(previousRead != -1){
+                close(previousRead);
             }
-        }
 
+            abandonJob(job, jobManager);
+            return;
+        }
 
         pid_t pid = fork();
 
         if(pid < 0){
             perror("fork");
-            
+
             if(!last){
                 close(pipefd[0]);
                 close(pipefd[1]);
@@ -61,52 +80,37 @@ void Executor::executeMultiPipeline(const Pipeline& pipeline){
                 close(previousRead);
             }
 
-            for(pid_t child : children){
-                waitpid(child, nullptr, 0);
-            }
-
+            abandonJob(job, jobManager);
             return ;
         }
 
-
         if(pid == 0){
-
-            // - ---------- CHILD ----------------
-
-            if(!first){
-                if(dup2(previousRead, STDIN_FILENO) < 0){
-                    perror("dup2");
-                    std::exit(EXIT_FAILURE);
-                }
-            }
-
+            // ---------- CHILD ----------
             if(!last){
-                if(dup2( pipefd[1] , STDOUT_FILENO) < 0){
-                    perror("dup2");
-                    std::exit(EXIT_FAILURE);
-                }
+                close(pipefd[0]); // read end belongs to the next stage
             }
 
-            if(previousRead != -1){
-                close(previousRead);
-            }
-
-
-            if(!last){
-                close(pipefd[0]);
-                close(pipefd[1]);                
-            }
-
-
-
-            executeSingleCommandHelper(pipeline.commands[i]);
-
-            std::exit(EXIT_FAILURE);
-
-
+            runChild(
+                pipeline.commands[i],
+                job.processGroupId,
+                foreground,
+                interactive,
+                previousRead == -1 ? STDIN_FILENO : previousRead,
+                last ? STDOUT_FILENO : pipefd[1],
+                runBuiltin
+            );
         }
 
-        children.push_back(pid);
+        // ---------- PARENT ----------
+        // The first stage leads the job's process group. Both parent and
+        // child call setpgid() so the group exists whichever runs first.
+        if(job.processGroupId == 0){
+            job.processGroupId = pid;
+        }
+
+        setpgid(pid, job.processGroupId);
+
+        job.pids.push_back(pid);
 
         if(previousRead != -1){
             close(previousRead);
@@ -116,175 +120,83 @@ void Executor::executeMultiPipeline(const Pipeline& pipeline){
             close(pipefd[1]);
             previousRead = pipefd[0];
         }
-
-
     }
 
-    if(previousRead != -1){
-        close(previousRead);
-    }
+    if(!foreground)
+    {
+        int jobId = jobManager.addJob(job);
 
-    for(pid_t child : children){
-        waitpid(child, nullptr, 0) ;
-    }
-}
+        std::cout
+            << "[" << jobId << "] "
+            << job.processGroupId
+            << "\n";
 
-void Executor::executePipeline(const Pipeline &pipeline)
-{
-
-    if(pipeline.commands.size() != 2){
-        std::cerr << "Only one pipe supported currently\n";
-        return ;
-    }
-
-    int pipefd[2];
-
-    if(pipe(pipefd) < 0){
-        perror("pipe");
-        return ;
-    }
-
-    // LEFT CHILD
-    pid_t leftChild = fork();
-
-    if(leftChild < 0){
-        close(pipefd[0]);
-        close(pipefd[1]);
-        perror("fork");
         return;
     }
 
-    if(leftChild == 0){
-        if(dup2(pipefd[1], STDOUT_FILENO) < 0){
-
-            close(pipefd[0]);
-            close(pipefd[1]);
-
-            perror("dup2");
-            std::exit(EXIT_FAILURE);
-        }
-        
-        close(pipefd[0]);
-        close(pipefd[1]);
-
-        executeSingleCommandHelper(pipeline.commands[0]);
-    }
-
-    // RIGHT CHILD
-    pid_t rightChild = fork();
-
-    if(rightChild < 0){
-        close(pipefd[0]);
-        close(pipefd[1]);
-
-        waitpid(leftChild,nullptr,0);
-
-        perror("fork");
-        return;
-    }
-
-    if(rightChild == 0){
-        if(dup2(pipefd[0], STDIN_FILENO) < 0){
-            close(pipefd[0]);
-            close(pipefd[1]);
-
-            perror("dup2");
-            std::exit(EXIT_FAILURE);
-        }
-        
-        close(pipefd[0]);
-        close(pipefd[1]);
-
-        executeSingleCommandHelper(pipeline.commands[1]);
-    }
-
-    // PARENT 
-    close(pipefd[0]);
-    close(pipefd[1]);
-
-    waitpid(leftChild,nullptr,0);
-    waitpid(rightChild,nullptr,0);        
-
-
-
-
-
-}
-
-void Executor::executeSingleCommand(const Command &command, bool background, JobManager& jobManager)
-{
-
-    pid_t pid = fork();
-
-    if (pid == 0)
+    if(jobManager.waitInForeground(job, false))
     {
-        // if(setpgid(0, 0) < 0)
-        // {
-        //     perror("setpgid");
-        //     std::exit(EXIT_FAILURE);
-        // }
+        int jobId = jobManager.addJob(job);
 
-        executeSingleCommandHelper(command);
-    }
-    else if (pid > 0)
-    {
-        // setpgid(pid,pid);
-
-        if(background)
-        {
-            int jobId =
-                jobManager.addJob(
-                    pid,
-                    pid,
-                    command.program,
-                    JobStatus::Running
-                );
-
-            std::cout
-                << "[" << jobId << "] "
-                << pid
-                << "\n";
-        }
-        else{
-            int status;
-
-            waitpid(
-                pid,
-                &status,
-                WUNTRACED
-            );
-            
-            if(WIFSTOPPED(status))
-            {
-                int jobId =
-                    jobManager.addJob(
-                        pid,
-                        pid,
-                        command.program,
-                        JobStatus::Stopped
-                    );
-
-                std::cout
-                    << "[" << jobId << "] Stopped "
-                    << command.program
-                    << "\n";
-            }
-        }
-
-    }
-    else
-    {
-        perror("fork");
+        std::cout
+            << "[" << jobId << "] Stopped "
+            << job.command
+            << "\n";
     }
 }
 
-void Executor::executeSingleCommandHelper(const Command &command)
+void Executor::runChild(
+    const Command& command,
+    pid_t processGroup,
+    bool foreground,
+    bool interactive,
+    int inputFd,
+    int outputFd,
+    const BuiltinRunner& runBuiltin)
 {
-    // child process
+    pid_t self = getpid();
 
-    if (command.arguments.empty())
-    {
-        std::exit(EXIT_FAILURE);
+    if(processGroup == 0){
+        processGroup = self;
+    }
+
+    setpgid(self, processGroup);
+
+    // Must happen before SIGTTOU is reset to its default, or the call
+    // would stop this process.
+    if(foreground && interactive){
+        tcsetpgrp(STDIN_FILENO, processGroup);
+    }
+
+    resetChildSignals();
+
+    if(inputFd != STDIN_FILENO){
+        if(dup2(inputFd, STDIN_FILENO) < 0){
+            perror("dup2");
+            _exit(EXIT_FAILURE);
+        }
+        close(inputFd);
+    }
+
+    if(outputFd != STDOUT_FILENO){
+        if(dup2(outputFd, STDOUT_FILENO) < 0){
+            perror("dup2");
+            _exit(EXIT_FAILURE);
+        }
+        close(outputFd);
+    }
+
+    if(!applyRedirections(command)){
+        _exit(EXIT_FAILURE);
+    }
+
+    // Builtins in a pipeline or in the background run in this child,
+    // so e.g. `history | grep ls` works. State changes (cd, export)
+    // only affect the child, as in other shells.
+    if(runBuiltin(command)){
+        std::cout.flush();
+        std::fflush(nullptr);
+        _exit(EXIT_SUCCESS);
     }
 
     std::vector<char *> argv;
@@ -294,6 +206,44 @@ void Executor::executeSingleCommandHelper(const Command &command)
         argv.push_back(const_cast<char *>(arg.c_str())); // stripping away the constness as the execvp is an older API and expects char*
     }
     argv.push_back(nullptr);
+
+    execvp(argv[0], argv.data());
+
+    int error = errno;
+
+    if(error == ENOENT){
+        std::cerr << "mysh: " << command.program << ": command not found\n";
+    }else{
+        std::cerr << "mysh: " << command.program << ": " << std::strerror(error) << "\n";
+    }
+
+    // _exit() rather than exit(): don't run the shell's atexit handlers
+    // or flush stdio buffers copied from the parent.
+    _exit(error == ENOENT ? 127 : 126);
+}
+
+bool Executor::applyRedirections(const Command &command)
+{
+    if (!command.inputFile.empty())
+    {
+        int fd = open(command.inputFile.c_str(), O_RDONLY);
+
+        if (fd < 0)
+        {
+            perror(command.inputFile.c_str());
+            return false;
+        }
+
+        if (dup2(fd, STDIN_FILENO) < 0)
+        {
+            perror("dup2");
+            close(fd);
+            return false;
+        }
+
+        close(fd);
+    }
+
     if (!command.outputFile.empty())
     {
         int flags = O_WRONLY | O_CREAT;
@@ -303,54 +253,23 @@ void Executor::executeSingleCommandHelper(const Command &command)
         else
             flags |= O_TRUNC;
 
-        int fd = open(command.outputFile.c_str(),
-                      flags,
-                      0644);
+        int fd = open(command.outputFile.c_str(), flags, 0644);
 
         if (fd < 0)
         {
-            perror("open");
-            std::exit(EXIT_FAILURE);
+            perror(command.outputFile.c_str());
+            return false;
         }
 
         if (dup2(fd, STDOUT_FILENO) < 0)
         {
             perror("dup2");
-            std::exit(EXIT_FAILURE);
+            close(fd);
+            return false;
         }
+
         close(fd); // closing the file descriptor
     }
 
-    if (!command.inputFile.empty())
-    {
-
-        int fd = open(command.inputFile.c_str(), O_RDONLY);
-
-        if (fd < 0)
-        {
-            perror("open");
-            std::exit(EXIT_FAILURE);
-        }
-
-        if (dup2(fd, STDIN_FILENO) < 0)
-        {
-            perror("dup2");
-            close(fd);
-            std::exit(EXIT_FAILURE);
-        }
-
-        close(fd);
-    }
-
-    signal(SIGINT, SIG_DFL);
-
-    signal(SIGTSTP, SIG_DFL);
-
-    signal(SIGQUIT, SIG_DFL);
-
-    execvp(argv[0], argv.data()); // string,vector<char*>
-
-    perror("Execvp Failed in the Child Process");
-
-    std::exit(EXIT_FAILURE);
+    return true;
 }

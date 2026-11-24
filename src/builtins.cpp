@@ -1,13 +1,81 @@
 #include "builtins.h"
 #include <iostream>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <cstdlib> // used for getenv() function
 
-#include <signal.h>
 #include <readline/history.h>
+#include <charconv>
+#include <unordered_set>
 
+// Parses "<n>" or "%<n>" into a job id. Returns false on malformed input.
+static bool parseJobId(const std::string& text, int& jobId)
+{
+    const char* begin = text.data();
+    const char* end = text.data() + text.size();
 
+    if (begin != end && *begin == '%')
+        ++begin;
+
+    if (begin == end)
+        return false;
+
+    auto [ptr, ec] = std::from_chars(begin, end, jobId);
+    return ec == std::errc() && ptr == end;
+}
+
+// Finds the job named by `fg`/`bg`'s argument, or the most recent job when
+// no argument is given. Prints an error and returns nullptr if none matches.
+static Job* lookupJob(const Command& command, JobManager& jobManager)
+{
+    const std::string& name = command.program;
+
+    if(command.arguments.size() > 2)
+    {
+        std::cerr << "Usage: " << name << " [job-id]\n";
+        return nullptr;
+    }
+
+    if(command.arguments.size() == 1)
+    {
+        Job* job = jobManager.currentJob();
+
+        if(job == nullptr)
+        {
+            std::cerr << name << ": no current job\n";
+        }
+
+        return job;
+    }
+
+    int jobId = 0;
+
+    if(!parseJobId(command.arguments[1], jobId))
+    {
+        std::cerr << name << ": invalid job id: "
+                  << command.arguments[1] << "\n";
+        return nullptr;
+    }
+
+    Job* job = jobManager.findJob(jobId);
+
+    if(job == nullptr)
+    {
+        std::cerr << name << ": job not found: "
+                  << command.arguments[1] << "\n";
+    }
+
+    return job;
+}
+
+bool Builtins::isBuiltin(const std::string& name)
+{
+    static const std::unordered_set<std::string> names = {
+        "exit", "pwd", "cd", "jobs", "bg", "fg",
+        "history", "export", "unset"
+    };
+
+    return names.count(name) > 0;
+}
 
 bool Builtins::execute(
             const Command& command,
@@ -103,8 +171,7 @@ bool Builtins::execute(
         }
         else
         {
-            std::swap(previousDirectory, currentDirectory);
-            std::cout << currentDirectory << std::endl;
+            previousDirectory = currentDirectory;
         }
 
         return true;
@@ -112,6 +179,9 @@ bool Builtins::execute(
 
     if(command.program == "jobs")
     {
+        // Report jobs that finished since the last prompt first.
+        jobManager.reapBackgroundJobs();
+
         jobManager.printJobs();
 
         return true;
@@ -119,100 +189,42 @@ bool Builtins::execute(
 
     if(command.program == "bg")
     {
-        if(command.arguments.size() != 2)
-        {
-            std::cerr << "Usage: bg <job-id>\n";
-            return true;
-        }
-
-        int jobId =
-            std::stoi(command.arguments[1]);
-
-        Job* job =
-            jobManager.findJob(jobId);
+        Job* job = lookupJob(command, jobManager);
 
         if(job == nullptr)
         {
-            std::cerr
-                << "bg: job not found\n";
-
             return true;
         }
 
-        if(kill(job->pid, SIGCONT) < 0)
+        if(!jobManager.continueInBackground(*job))
         {
-            perror("bg");
             return true;
         }
-
-        job->status =
-            JobStatus::Running;
 
         std::cout
             << "[" << job->jobId
-            << "] Running "
+            << "] "
             << job->command
-            << "\n";
+            << " &\n";
 
         return true;
     }
 
     if(command.program == "fg")
     {
-        if(command.arguments.size() != 2)
-        {
-            std::cerr
-                << "Usage: fg <job-id>\n";
-
-            return true;
-        }
-
-        int jobId =
-            std::stoi(command.arguments[1]);
-
-        Job* job =
-            jobManager.findJob(jobId);
+        Job* job = lookupJob(command, jobManager);
 
         if(job == nullptr)
         {
-            std::cerr
-                << "fg: job not found\n";
-
             return true;
         }
-
-        if(kill(job->pid, SIGCONT) < 0)
-        {
-            perror("fg");
-            return true;
-        }
-
-        job->status =
-            JobStatus::Running;
 
         std::cout
             << job->command
             << std::endl;
 
-        int status;
-
-        pid_t result =
-            waitpid(
-                job->pid,
-                &status,
-                WUNTRACED
-            );
-
-        std::cout
-            << "waitpid returned "
-            << result
-            << std::endl;
-
-        if(WIFSTOPPED(status))
+        if(jobManager.waitInForeground(*job, true))
         {
-            job->status =
-                JobStatus::Stopped;
-
             std::cout
                 << "[" << job->jobId
                 << "] Stopped "
@@ -221,9 +233,7 @@ bool Builtins::execute(
         }
         else
         {
-            jobManager.removeJob(
-                job->pid
-            );
+            jobManager.removeJob(job->jobId);
         }
 
         return true;
@@ -281,6 +291,15 @@ bool Builtins::execute(
         std::string value =
             expr.substr(pos+1);
 
+        if(!Environment::isValidName(name))
+        {
+            std::cerr
+                << "export: not a valid identifier: "
+                << name << "\n";
+
+            return true;
+        }
+
         environment.setVariable(
             name,
             value
@@ -307,6 +326,10 @@ bool Builtins::execute(
 
         environment.unsetVariable(
             command.arguments[1]
+        );
+
+        unsetenv(
+            command.arguments[1].c_str()
         );
 
         return true;

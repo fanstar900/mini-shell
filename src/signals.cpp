@@ -1,49 +1,36 @@
-#include<iostream>
 #include "signals.h"
 
-#include "shell.h"
-
 #include <signal.h>
-#include <sys/wait.h>
 
-static void handleSigChild(int)
-{
-    int status;
-    pid_t pid;
+/*
+The shell no longer installs a SIGCHLD handler. Updating the job list from a
+signal handler is not async-signal-safe (it allocates memory, which can
+deadlock or corrupt the heap if the signal arrives while readline is
+allocating). Instead, finished background jobs are collected with a
+non-blocking waitpid() before each prompt (JobManager::reapBackgroundJobs),
+and foreground jobs are waited for directly.
+*/
 
-    while((pid = waitpid(-1, &status, WNOHANG)) > 0)
-    {
-        // std::cout << "Reaped child "
-        //           << pid
-        //           << std::endl;
-
-        if(gShell)
-        {
-            gShell->getJobManager()
-                  .removeJob(pid);
-        }
-    }
-}
+static const int jobControlSignals[] = {
+    SIGINT,
+    SIGQUIT,
+    SIGTSTP,
+    SIGTTIN,
+    SIGTTOU
+};
 
 void setupSignalHandlers()
 {
-    signal(SIGINT, SIG_IGN);
+    for(int sig : jobControlSignals)
+    {
+        signal(sig, SIG_IGN);
+    }
+}
 
-    signal(SIGTSTP, SIG_IGN);
-
-    signal(SIGQUIT, SIG_IGN);
-
-    struct sigaction sa;
-
-    sa.sa_handler = handleSigChild;
-
-    sigemptyset(&sa.sa_mask);
-
-    sa.sa_flags = SA_RESTART;
-
-    sigaction(
-        SIGCHLD,
-        &sa,
-        nullptr
-    );
+void resetChildSignals()
+{
+    for(int sig : jobControlSignals)
+    {
+        signal(sig, SIG_DFL);
+    }
 }

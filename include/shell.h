@@ -1,5 +1,4 @@
-#ifndef SHELL_H
-#define SHELL.H
+#pragma once
 
 #include <string>
 #include "executor.h"
@@ -8,17 +7,13 @@
 #include "job_manager.h"
 #include "environment.h"
 
-class Shell;
-
-extern Shell* gShell;
-
 class Shell
 {
     public:
         Shell();
         ~Shell();
         void run();
-                JobManager& getJobManager();
+
     private:
 
         Parser parser;
@@ -30,18 +25,22 @@ class Shell
         // States Management
         bool running;
         std::string previousDirectory;
-        
-        // void printPrompt() const; // prints mys>, this function can't modify the internal data members
-        std::string readInput() const ; 
 
-        void processInput(const std::string& input) ; 
+        std::string readInput() const ;
+
+        void processInput(const std::string& input) ;
+
+        // Expands variables in every argument and redirection target.
+        // Returns false (after printing an error) if the result is unusable.
+        bool expandPipeline(Pipeline& pipeline) const;
+
+        bool runBuiltin(const Command& command);
+
+        // Runs a builtin in the shell process, applying its redirections
+        // temporarily.
+        void runBuiltinInShell(const Command& command);
 
         void loadHistory();
 
         void saveHistory();
-
-
-
 };
-
-#endif

@@ -1,11 +1,15 @@
 #pragma once
 
-#include<string>
+#include <string>
 #include "pipeline.h"
 
 class Parser{
     public:
-        Pipeline parse(const std::string& input);
-    private:
-        Command parseSingleCommand(const std::string& input);
+        // Parses `input` into `pipeline`.
+        // Returns false and sets `error` when the input has a syntax error.
+        bool parse(
+            const std::string& input,
+            Pipeline& pipeline,
+            std::string& error
+        ) const;
 };

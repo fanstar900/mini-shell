@@ -1,6 +1,7 @@
 #pragma once
 
-#include<vector>
+#include <string>
+#include <vector>
 #include "command.h"
 
 class Pipeline{
@@ -8,4 +9,7 @@ class Pipeline{
         std::vector<Command> commands;
 
         bool background = false;
+
+        // The command line as typed (without a trailing '&'); shown by `jobs`.
+        std::string text;
 };

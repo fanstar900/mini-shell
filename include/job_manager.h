@@ -1,8 +1,9 @@
 #pragma once
 
-#include <vector>
 #include <string>
+#include <vector>
 #include <sys/types.h>
+#include <termios.h>
 
 enum class JobStatus
 {
@@ -12,43 +13,65 @@ enum class JobStatus
 
 struct Job
 {
-    int jobId;
+    int jobId = 0;
 
-    pid_t pid;
+    pid_t processGroupId = 0;
 
-    pid_t processGroupId;
+    // Processes of this job that have not exited yet.
+    std::vector<pid_t> pids;
 
     std::string command;
 
-    JobStatus status;
+    JobStatus status = JobStatus::Running;
+
+    // Terminal settings saved when the job was stopped, restored on `fg`.
+    bool hasTerminalModes = false;
+    struct termios terminalModes {};
 };
 
 class JobManager
 {
 public:
 
-    int addJob(
-        pid_t pid,
-        pid_t pgid,
-        const std::string& command,
-        JobStatus status
-    );
+    // Puts the shell in its own process group and takes the terminal
+    // (when stdin is a terminal), and installs the shell's signal setup.
+    void initTerminal();
 
-    void markStopped(pid_t pid);
+    bool isInteractive() const;
 
-    void markRunning(pid_t pid);
+    // Stores the job, assigns it a job id and returns that id.
+    int addJob(Job job);
 
-    void removeJob(pid_t pid);
+    void removeJob(int jobId);
 
     Job* findJob(int jobId);
 
-    Job* findJobByPid(pid_t pid);
+    // The most recently added job, or nullptr if there are none.
+    Job* currentJob();
 
     void printJobs() const;
 
+    // Gives the job the terminal and waits until all of its processes
+    // exit or one of them stops. Continues the job first if `resume`.
+    // Returns true if the job stopped.
+    bool waitInForeground(Job& job, bool resume);
+
+    // Sends SIGCONT to a stopped job without giving it the terminal.
+    bool continueInBackground(Job& job);
+
+    // Collects finished/stopped background processes without blocking
+    // and reports jobs that changed state.
+    void reapBackgroundJobs();
+
 private:
 
-    int nextJobId = 1;
+    Job* findJobByPid(pid_t pid);
 
     std::vector<Job> jobs;
+
+    bool interactive = false;
+
+    pid_t shellProcessGroup = 0;
+
+    struct termios shellTerminalModes {};
 };

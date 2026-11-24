@@ -1,80 +1,77 @@
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
+#include <unistd.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 
 #include "shell.h"
 #include "pipeline.h"
 
-Shell* gShell = nullptr;
+namespace
+{
+
+const int historySize = 1000;
+
+std::string historyFilePath()
+{
+    const char* home = std::getenv("HOME");
+
+    return home ? std::string(home) + "/.mysh_history" : "";
+}
+
+} // namespace
 
 Shell::Shell()
     : running(true)
 {
-    loadHistory();
+    jobManager.initTerminal();
 
-    gShell = this;
+    loadHistory();
 }
 
 Shell::~Shell()
 {
     saveHistory();
-
-    stifle_history(1000);
-
 }
 
 void Shell::loadHistory()
 {
-    const char* home =
-        getenv("HOME");
+    // Limit the history before loading so both the in-memory list and the
+    // file written on exit stay at most `historySize` entries.
+    stifle_history(historySize);
 
-    if(home)
+    std::string historyFile = historyFilePath();
+
+    if(!historyFile.empty())
     {
-        std::string historyFile =
-            std::string(home)
-            + "/.mysh_history";
-
-        read_history(
-            historyFile.c_str()
-        );
+        read_history(historyFile.c_str());
     }
 }
 
 void Shell::saveHistory()
 {
-    const char* home =
-        getenv("HOME");
+    std::string historyFile = historyFilePath();
 
-    if(home)
+    if(!historyFile.empty())
     {
-        std::string historyFile =
-            std::string(home)
-            + "/.mysh_history";
-
-        write_history(
-            historyFile.c_str()
-        );
+        write_history(historyFile.c_str());
     }
 }
 
 void Shell::run()
 {
-
     while(running)
     {
-        // printPrompt(); // readline already prints the prompt
+        // Report background jobs that finished or stopped since the last
+        // prompt, and collect their processes.
+        jobManager.reapBackgroundJobs();
 
-        std::string input = readInput() ; 
+        std::string input = readInput() ;
 
         processInput(input) ;
-
     }
 }
-
-// void Shell::printPrompt() const{
-//     std::cout << "mysh>";
-// }
-
 
 std::string Shell::readInput() const
 {
@@ -98,77 +95,152 @@ std::string Shell::readInput() const
     return input;
 }
 
-
 void Shell::processInput(const std::string&input){
-    
-    /*
-    Inefficient => parser and executor are constructed for each processInput call, we should have them as internal data member for this shell
-    Parser parser ; 
-    Executor executor ;
-    */
-    
-    
-    Pipeline pipeline = parser.parse(input);
 
-    // Expand environment variables
-    for(auto& command : pipeline.commands)
+    Pipeline pipeline;
+    std::string error;
+
+    if(!parser.parse(input, pipeline, error))
     {
-        for(auto& arg : command.arguments)
-        {
-            arg = environment.expand(arg);
-        }
+        std::cerr << "mysh: " << error << "\n";
+        return;
     }
-
-    // std::cout
-    // << "Background = "
-    // << pipeline.background
-    // << std::endl;
-
-    // for(const auto& cmd : pipeline.commands)
-    // {
-    //     std::cout << "Program: "
-    //             << cmd.program
-    //             << "\n";
-
-    //     for(const auto& arg : cmd.arguments)
-    //     {
-    //         std::cout
-    //             << "Arg: "
-    //             << arg
-    //             << "\n";
-    //     }
-    // }
-
-    // for(auto& cmd : pipeline.commands){
-    //     std::cout << cmd.program << std::endl;
-    // }
-
-    // loop over pipeline for command and connect their file descriptors
-
-
 
     if(pipeline.commands.empty()) return ;
 
-    if(pipeline.commands.size() == 1){
-        if(builtins.execute(
-                pipeline.commands[0],
-                running,
-                previousDirectory,
-                jobManager,
-                environment))
-        {
-            return;
-        }
+    if(!expandPipeline(pipeline)) return ;
+
+    const Command& first = pipeline.commands[0];
+
+    // A lone foreground builtin runs in the shell itself so it can change
+    // shell state (cd, export, exit, ...). Builtins in pipelines or in the
+    // background run in a child process, like external commands.
+    if(pipeline.commands.size() == 1 &&
+       !pipeline.background &&
+       Builtins::isBuiltin(first.program))
+    {
+        runBuiltinInShell(first);
+        return;
     }
 
     executor.execute(
         pipeline,
-        jobManager
+        jobManager,
+        [this](const Command& command)
+        {
+            return runBuiltin(command);
+        }
     );
-
 }
 
-JobManager& Shell::getJobManager()
+bool Shell::expandPipeline(Pipeline& pipeline) const
 {
-    return jobManager;
+    for(auto& command : pipeline.commands)
+    {
+        std::vector<std::string> expanded;
+
+        for(const auto& arg : command.arguments)
+        {
+            std::string value = environment.expand(arg);
+
+            // Without quoting, a word that expands to nothing disappears,
+            // as in other shells: `echo a $UNSET b` prints "a b".
+            if(!value.empty())
+            {
+                expanded.push_back(value);
+            }
+        }
+
+        command.arguments = std::move(expanded);
+
+        for(std::string* file : {&command.inputFile, &command.outputFile})
+        {
+            if(file->empty())
+            {
+                continue;
+            }
+
+            std::string value = environment.expand(*file);
+
+            if(value.empty())
+            {
+                std::cerr << "mysh: " << *file << ": ambiguous redirect\n";
+                return false;
+            }
+
+            *file = value;
+        }
+
+        command.program =
+            command.arguments.empty() ? "" : command.arguments[0];
+    }
+
+    for(const auto& command : pipeline.commands)
+    {
+        if(command.arguments.empty())
+        {
+            // A line such as "$UNSET" alone does nothing; inside a pipeline
+            // or with a redirection there is no command to run.
+            if(pipeline.commands.size() > 1 || command.hasRedirection())
+            {
+                std::cerr << "mysh: empty command after variable expansion\n";
+            }
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool Shell::runBuiltin(const Command& command)
+{
+    return builtins.execute(
+        command,
+        running,
+        previousDirectory,
+        jobManager,
+        environment
+    );
+}
+
+void Shell::runBuiltinInShell(const Command& command)
+{
+    if(!command.hasRedirection())
+    {
+        runBuiltin(command);
+        return;
+    }
+
+    // Point stdin/stdout at the redirection targets for the duration of the
+    // builtin, then put the shell's own descriptors back.
+    std::cout.flush();
+    std::fflush(nullptr);
+
+    int savedInput = dup(STDIN_FILENO);
+    int savedOutput = dup(STDOUT_FILENO);
+
+    if(savedInput < 0 || savedOutput < 0)
+    {
+        perror("mysh: dup");
+
+        if(savedInput >= 0) close(savedInput);
+        if(savedOutput >= 0) close(savedOutput);
+
+        return;
+    }
+
+    if(Executor::applyRedirections(command))
+    {
+        runBuiltin(command);
+    }
+
+    std::cout.flush();
+    std::fflush(nullptr);
+
+    dup2(savedInput, STDIN_FILENO);
+    dup2(savedOutput, STDOUT_FILENO);
+
+    close(savedInput);
+    close(savedOutput);
 }
